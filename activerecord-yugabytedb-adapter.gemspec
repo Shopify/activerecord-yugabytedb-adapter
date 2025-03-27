@@ -4,7 +4,7 @@ require_relative "lib/version"
 
 Gem::Specification.new do |spec|
   spec.name = "activerecord-yugabytedb-adapter"
-  spec.version = ActiveRecord::YUGABYTE_DB_ADAPTER_VERSION
+  spec.version = YugabyteDB::VERSION
   spec.authors = ["YugabyteDB Development Team"]
   spec.email = ["info@yugabyte.com"]
 
