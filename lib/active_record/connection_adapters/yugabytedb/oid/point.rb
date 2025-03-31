@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 
 module ActiveRecord
-  Point = Struct.new(:x, :y)
+  Point = Struct.new(:x, :y) unless defined?(Point)
 
   module ConnectionAdapters
     module YugabyteDB
