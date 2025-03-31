@@ -9,7 +9,7 @@ module ActiveRecord
 
       def initialize(env_name, name, configuration_hash = {})
         super
-        yugabytedb = configuration_hash.delete(:yugabytedb)
+        yugabytedb = configuration_hash.delete(:yugabytedb) || {}
         @load_balance = yugabytedb[:load_balance]
         @topology_keys = yugabytedb[:topology_keys]
 
