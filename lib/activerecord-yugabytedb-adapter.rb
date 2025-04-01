@@ -1,3 +1,5 @@
+require "active_record/database_configurations"
+
 if defined?(Rails::Railtie)
   module ActiveRecord
     module ConnectionAdapters
@@ -11,6 +13,15 @@ if defined?(Rails::Railtie)
               "ActiveRecord::ConnectionAdapters::YugabyteDBAdapter",
               "active_record/connection_adapters/yugabytedb_adapter",
             )
+          end
+        end
+
+        if ActiveRecord::DatabaseConfigurations.respond_to?(:register_db_config_handler)
+          require "active_record/database_configurations/yugabyte_db_config"
+          ActiveRecord::DatabaseConfigurations.register_db_config_handler do |env_name, name, url, config|
+            next unless config[:adapter] == "yugabytedb"
+
+            ActiveRecord::DatabaseConfigurations::YugabyteDBConfig.new(env_name, name, config)
           end
         end
 
