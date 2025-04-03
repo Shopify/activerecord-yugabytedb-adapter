@@ -15,6 +15,18 @@ if defined?(Rails::Railtie)
             )
           end
         end
+
+        require "active_record/database_configurations"
+          
+        if ActiveRecord::DatabaseConfigurations.respond_to?(:register_db_config_handler)
+          require "active_record/database_configurations/yugabyte_db_config"
+
+          ActiveRecord::DatabaseConfigurations.register_db_config_handler do |env_name, name, url, config|
+            next unless config[:adapter] == "yugabytedb"
+
+            ActiveRecord::DatabaseConfigurations::YugabyteDBConfig.new(env_name, name, config)
+          end
+        end
       end
     end
   end
