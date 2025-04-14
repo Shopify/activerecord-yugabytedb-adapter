@@ -11,7 +11,7 @@ Gem::Specification.new do |spec|
   spec.summary = "YugabyteDB adapter for ActiveRecord."
   spec.description = "YugabyteDB adapter for ActiveRecord."
   spec.homepage = "https://docs.yugabyte.com/preview/drivers-orms/ruby/activerecord/"
-  spec.required_ruby_version = ">= 2.6.0"
+  spec.required_ruby_version = ">= 3.3"
 
   spec.metadata["homepage_uri"] = spec.homepage
   spec.metadata["source_code_uri"] = "https://github.com/yugabyte/activerecord-yugabytedb-adapter"
@@ -30,7 +30,7 @@ Gem::Specification.new do |spec|
 
   # Uncomment to register a new dependency of your gem
   # spec.add_dependency "example-gem", "~> 1.0"
-  spec.add_dependency "activerecord", "7.1.3.4"
+  spec.add_dependency "activerecord", ">= 7.1.3.4"
   spec.add_dependency "yugabytedb-ysql", "~> 0.3"
 
 

@@ -21,14 +21,16 @@ require "active_record/connection_adapters/yugabytedb/type_metadata"
 require "active_record/connection_adapters/yugabytedb/utils"
 
 module ActiveRecord
-  module ConnectionHandling # :nodoc:
-    def yugabytedb_adapter_class
-      ConnectionAdapters::YugabyteDBAdapter
-    end
+  if Rails.gem_version < Gem::Version.new("7.2.0.alpha")
+    module ConnectionHandling # :nodoc:
+      def yugabytedb_adapter_class
+        ConnectionAdapters::YugabyteDBAdapter
+      end
 
-    # Establishes a connection to the database that's used by all Active Record objects
-    def yugabytedb_connection(config)
-      yugabytedb_adapter_class.new(config)
+      # Establishes a connection to the database that's used by all Active Record objects
+      def yugabytedb_connection(config)
+        yugabytedb_connection_class.new(config)
+      end
     end
   end
 
@@ -123,16 +125,25 @@ module ActiveRecord
       # Change this in an initializer to use another NATIVE_DATABASE_TYPES. For example, to
       # store DateTimes as "timestamp with time zone":
       #
-      #   ActiveRecord::ConnectionAdapters::PostgreSQLAdapter.datetime_type = :timestamptz
+      #   ActiveRecord::ConnectionAdapters::YugabyteDBdapter.datetime_type = :timestamptz
       #
       # Or if you are adding a custom type:
       #
-      #   ActiveRecord::ConnectionAdapters::PostgreSQLAdapter::NATIVE_DATABASE_TYPES[:my_custom_type] = { name: "my_custom_type_name" }
-      #   ActiveRecord::ConnectionAdapters::PostgreSQLAdapter.datetime_type = :my_custom_type
+      #   ActiveRecord::ConnectionAdapters::YugabyteDBdapter::NATIVE_DATABASE_TYPES[:my_custom_type] = { name: "my_custom_type_name" }
+      #   ActiveRecord::ConnectionAdapters::YugabyteDBdapter.datetime_type = :my_custom_type
       #
       # If you're using +:ruby+ as your +config.active_record.schema_format+ and you change this
       # setting, you should immediately run <tt>bin/rails db:migrate</tt> to update the types in your schema.rb.
       class_attribute :datetime_type, default: :timestamp
+
+      ##
+      # :singleton-method:
+      # Toggles automatic decoding of date columns.
+      #
+      #   ActiveRecord::ConnectionAdapters::YugabyteDBdapter.select_value("select '2024-01-01'::date").class #=> String
+      #   ActiveRecord::ConnectionAdapters::YugabyteDBdapter.decode_dates = true
+      #   ActiveRecord::ConnectionAdapters::YugabyteDBdapter.select_value("select '2024-01-01'::date").class #=> Date
+      class_attribute :decode_dates, default: false
 
       NATIVE_DATABASE_TYPES = {
         primary_key: "bigserial primary key",
@@ -287,12 +298,12 @@ module ActiveRecord
         database_version >= 15_00_00 # >= 15.0
       end
 
-      def index_algorithms
-        { concurrently: "CONCURRENTLY" }
+      def supports_native_partitioning? # :nodoc:
+        database_version >= 10_00_00 # >= 10.0
       end
 
-      def return_value_after_insert?(column) # :nodoc:
-        column.auto_populated?
+      def index_algorithms
+        { concurrently: "CONCURRENTLY" }
       end
 
       class StatementPool < ConnectionAdapters::StatementPool # :nodoc:
@@ -329,7 +340,7 @@ module ActiveRecord
         conn_params[:user] = conn_params.delete(:username) if conn_params[:username]
         conn_params[:dbname] = conn_params.delete(:database) if conn_params[:database]
 
-        # Forward only valid config params to PG::Connection.connect.
+        # Forward only valid config params to YSQL::Connection.connect.
         valid_conn_param_keys = YSQL::Connection.conndefaults_hash.keys + [:requiressl]
         conn_params.slice!(*valid_conn_param_keys)
 
@@ -343,11 +354,16 @@ module ActiveRecord
         @use_insert_returning = @config.key?(:insert_returning) ? self.class.type_cast_config_to_boolean(@config[:insert_returning]) : true
       end
 
+      def connected?
+        !(@raw_connection.nil? || @raw_connection.finished?)
+      end
+
       # Is this connection alive and ready for queries?
       def active?
         @lock.synchronize do
           return false unless @raw_connection
           @raw_connection.query ";"
+          verified!
         end
         true
       rescue YSQL::Error
@@ -408,7 +424,7 @@ module ActiveRecord
       end
 
       def set_standard_conforming_strings
-        internal_execute("SET standard_conforming_strings = on")
+        internal_execute("SET standard_conforming_strings = on", "SCHEMA")
       end
 
       def supports_ddl_transactions?
@@ -482,6 +498,7 @@ module ActiveRecord
       #   Set to +:cascade+ to drop dependent objects as well.
       #   Defaults to false.
       def disable_extension(name, force: false)
+        _schema, name = name.to_s.split(".").values_at(-2, -1)
         internal_exec_query("DROP EXTENSION IF EXISTS \"#{name}\"#{' CASCADE' if force == :cascade}").tap {
           reload_type_map
         }
@@ -496,7 +513,19 @@ module ActiveRecord
       end
 
       def extensions
-        internal_exec_query("SELECT extname FROM pg_extension", "SCHEMA", allow_retry: true, materialize_transactions: false).cast_values
+        query = <<~SQL
+          SELECT
+            pg_extension.extname,
+            n.nspname AS schema
+          FROM pg_extension
+          JOIN pg_namespace n ON pg_extension.extnamespace = n.oid
+        SQL
+
+        internal_exec_query(query, "SCHEMA", allow_retry: true, materialize_transactions: false).cast_values.map do |row|
+          name, schema = row[0], row[1]
+          schema = nil if schema == current_schema
+          [schema, name].compact.join(".")
+        end
       end
 
       # Returns a list of defined enum types, and their values.
@@ -506,7 +535,7 @@ module ActiveRecord
             type.typname AS name,
             type.OID AS oid,
             n.nspname AS schema,
-            string_agg(enum.enumlabel, ',' ORDER BY enum.enumsortorder) AS value
+            array_agg(enum.enumlabel ORDER BY enum.enumsortorder) AS value
           FROM pg_enum AS enum
           JOIN pg_type AS type ON (type.oid = enum.enumtypid)
           JOIN pg_namespace n ON type.typnamespace = n.oid
@@ -561,30 +590,34 @@ module ActiveRecord
       end
 
       # Rename an existing enum type to something else.
-      def rename_enum(name, options = {})
-        to = options.fetch(:to) { raise ArgumentError, ":to is required" }
+      def rename_enum(name, new_name = nil, **options)
+        new_name ||= options.fetch(:to) do
+          raise ArgumentError, "rename_enum requires two from/to name positional arguments."
+        end
 
-        exec_query("ALTER TYPE #{quote_table_name(name)} RENAME TO #{to}").tap { reload_type_map }
+        exec_query("ALTER TYPE #{quote_table_name(name)} RENAME TO #{quote_table_name(new_name)}").tap { reload_type_map }
       end
 
       # Add enum value to an existing enum type.
-      def add_enum_value(type_name, value, options = {})
+      def add_enum_value(type_name, value, **options)
         before, after = options.values_at(:before, :after)
-        sql = +"ALTER TYPE #{quote_table_name(type_name)} ADD VALUE '#{value}'"
+        sql = +"ALTER TYPE #{quote_table_name(type_name)} ADD VALUE"
+        sql << " IF NOT EXISTS" if options[:if_not_exists]
+        sql << " #{quote(value)}"
 
         if before && after
           raise ArgumentError, "Cannot have both :before and :after at the same time"
         elsif before
-          sql << " BEFORE '#{before}'"
+          sql << " BEFORE #{quote(before)}"
         elsif after
-          sql << " AFTER '#{after}'"
+          sql << " AFTER #{quote(after)}"
         end
 
         execute(sql).tap { reload_type_map }
       end
 
       # Rename enum value on an existing enum type.
-      def rename_enum_value(type_name, options = {})
+      def rename_enum_value(type_name, **options)
         unless database_version >= 10_00_00 # >= 10.0
           raise ArgumentError, "Renaming enum values is only supported in PostgreSQL 10 or later"
         end
@@ -592,7 +625,7 @@ module ActiveRecord
         from = options.fetch(:from) { raise ArgumentError, ":from is required" }
         to = options.fetch(:to) { raise ArgumentError, ":to is required" }
 
-        execute("ALTER TYPE #{quote_table_name(type_name)} RENAME VALUE '#{from}' TO '#{to}'").tap {
+        execute("ALTER TYPE #{quote_table_name(type_name)} RENAME VALUE #{quote(from)} TO #{quote(to)}").tap {
           reload_type_map
         }
       end
@@ -614,7 +647,13 @@ module ActiveRecord
 
       # Returns the version of the connected YugabyteDB server.
       def get_database_version # :nodoc:
-        valid_raw_connection.server_version
+        with_raw_connection do |conn|
+          version = conn.server_version
+          if version == 0
+            raise ActiveRecord::ConnectionFailed, "Could not determine YugabyteDB version"
+          end
+          version
+        end
       end
       alias :yugabytedb_version :database_version
 
@@ -778,7 +817,7 @@ module ActiveRecord
 
           case exception.result.try(:error_field, YSQL::PG_DIAG_SQLSTATE)
           when nil
-            if exception.message.match?(/connection is closed/i)
+            if exception.message.match?(/connection is closed/i) || exception.message.match?(/no connection to the server/i)
               ConnectionNotEstablished.new(exception, connection_pool: @pool)
             elsif exception.is_a?(YSQL::ConnectionBad)
               # libpq message style always ends with a newline; the pg gem's internal
@@ -842,9 +881,8 @@ module ActiveRecord
         def load_additional_types(oids = nil)
           initializer = OID::TypeMapInitializer.new(type_map)
           load_types_queries(initializer, oids) do |query|
-            execute_and_clear(query, "SCHEMA", [], allow_retry: true, materialize_transactions: false) do |records|
-              initializer.run(records)
-            end
+            records = internal_execute(query, "SCHEMA", [], allow_retry: true, materialize_transactions: false)
+            initializer.run(records)
           end
         end
 
@@ -865,71 +903,6 @@ module ActiveRecord
 
         FEATURE_NOT_SUPPORTED = "0A000" # :nodoc:
 
-        def execute_and_clear(sql, name, binds, prepare: false, async: false, allow_retry: false, materialize_transactions: true)
-          sql = transform_query(sql)
-          check_if_write_query(sql)
-
-          if !prepare || without_prepared_statement?(binds)
-            result = exec_no_cache(sql, name, binds, async: async, allow_retry: allow_retry, materialize_transactions: materialize_transactions)
-          else
-            result = exec_cache(sql, name, binds, async: async, allow_retry: allow_retry, materialize_transactions: materialize_transactions)
-          end
-          begin
-            ret = yield result
-          ensure
-            result.clear
-          end
-          ret
-        end
-
-        def exec_no_cache(sql, name, binds, async:, allow_retry:, materialize_transactions:)
-          mark_transaction_written_if_write(sql)
-
-          # make sure we carry over any changes to ActiveRecord.default_timezone that have been
-          # made since we established the connection
-          update_typemap_for_default_timezone
-
-          type_casted_binds = type_casted_binds(binds)
-          log(sql, name, binds, type_casted_binds, async: async) do
-            with_raw_connection do |conn|
-              result = conn.exec_params(sql, type_casted_binds)
-              verified!
-              result
-            end
-          end
-        end
-
-        def exec_cache(sql, name, binds, async:, allow_retry:, materialize_transactions:)
-          mark_transaction_written_if_write(sql)
-
-          update_typemap_for_default_timezone
-
-          with_raw_connection do |conn|
-            stmt_key = prepare_statement(sql, binds, conn)
-            type_casted_binds = type_casted_binds(binds)
-
-            log(sql, name, binds, type_casted_binds, stmt_key, async: async) do
-              result = conn.exec_prepared(stmt_key, type_casted_binds)
-              verified!
-              result
-            end
-          end
-        rescue ActiveRecord::StatementInvalid => e
-          raise unless is_cached_plan_failure?(e)
-
-          # Nothing we can do if we are in a transaction because all commands
-          # will raise InFailedSQLTransaction
-          if in_transaction?
-            raise ActiveRecord::PreparedStatementCacheExpired.new(e.cause.message)
-          else
-            @lock.synchronize do
-              # outside of transactions we can simply flush this query and retry
-              @statements.delete sql_key(sql)
-            end
-            retry
-          end
-        end
-
         # Annoyingly, the code for prepared statements whose return value may
         # have changed is FEATURE_NOT_SUPPORTED.
         #
@@ -939,8 +912,7 @@ module ActiveRecord
         #
         # Check here for more details:
         # https://git.postgresql.org/gitweb/?p=postgresql.git;a=blob;f=src/backend/utils/cache/plancache.c#l573
-        def is_cached_plan_failure?(e)
-          pgerror = e.cause
+        def is_cached_plan_failure?(pgerror)
           pgerror.result.result_error_field(YSQL::PG_DIAG_SQLSTATE) == FEATURE_NOT_SUPPORTED &&
             pgerror.result.result_error_field(YSQL::PG_DIAG_SOURCE_FUNCTION) == "RevalidateCachedQuery"
         rescue
@@ -996,6 +968,8 @@ module ActiveRecord
         # Configures the encoding, verbosity, schema search path, and time zone of the connection.
         # This is called by #connect and should not be called manually.
         def configure_connection
+          super
+
           if @config[:encoding]
             @raw_connection.set_client_encoding(@config[:encoding])
           end
@@ -1017,16 +991,16 @@ module ActiveRecord
           variables = @config.fetch(:variables, {}).stringify_keys
 
           # Set interval output format to ISO 8601 for ease of parsing by ActiveSupport::Duration.parse
-          internal_execute("SET intervalstyle = iso_8601")
+          internal_execute("SET intervalstyle = iso_8601", "SCHEMA")
 
           # SET statements from :variables config hash
           # https://www.postgresql.org/docs/current/static/sql-set.html
           variables.map do |k, v|
             if v == ":default" || v == :default
               # Sets the value to the global or compile default
-              internal_execute("SET SESSION #{k} TO DEFAULT")
+              internal_execute("SET SESSION #{k} TO DEFAULT", "SCHEMA")
             elsif !v.nil?
-              internal_execute("SET SESSION #{k} TO #{quote(v)}")
+              internal_execute("SET SESSION #{k} TO #{quote(v)}", "SCHEMA")
             end
           end
 
@@ -1047,9 +1021,9 @@ module ActiveRecord
           # If using Active Record's time zone support configure the connection
           # to return TIMESTAMP WITH ZONE types in UTC.
           if default_timezone == :utc
-            internal_execute("SET SESSION timezone TO 'UTC'")
+            raw_execute("SET SESSION timezone TO 'UTC'", "SCHEMA")
           else
-            internal_execute("SET SESSION timezone TO DEFAULT")
+            raw_execute("SET SESSION timezone TO DEFAULT", "SCHEMA")
           end
         end
 
@@ -1116,9 +1090,8 @@ module ActiveRecord
                     AND castsource = #{quote column.sql_type}::regtype
                 )
               SQL
-              execute_and_clear(sql, "SCHEMA", [], allow_retry: true, materialize_transactions: false) do |result|
-                result.getvalue(0, 0)
-              end
+              result = internal_execute(sql, "SCHEMA", [], allow_retry: true, materialize_transactions: false)
+              result.getvalue(0, 0)
             end
           end
         end
@@ -1134,8 +1107,8 @@ module ActiveRecord
         def update_typemap_for_default_timezone
           if @raw_connection && @mapped_default_timezone != default_timezone && @timestamp_decoder
             decoder_class = default_timezone == :utc ?
-                              YSQL::TextDecoder::TimestampUtc :
-                              YSQL::TextDecoder::TimestampWithoutTimeZone
+              YSQL::TextDecoder::TimestampUtc :
+              YSQL::TextDecoder::TimestampWithoutTimeZone
 
             @timestamp_decoder = decoder_class.new(**@timestamp_decoder.to_h)
             @raw_connection.type_map_for_results.add_coder(@timestamp_decoder)
@@ -1166,6 +1139,7 @@ module ActiveRecord
             "timestamp" => YSQL::TextDecoder::TimestampUtc,
             "timestamptz" => YSQL::TextDecoder::TimestampWithTimeZone,
           }
+          coders_by_name["date"] = YSQL::TextDecoder::Date if decode_dates
 
           known_coder_types = coders_by_name.keys.map { |n| quote(n) }
           query = <<~SQL % known_coder_types.join(", ")
@@ -1173,9 +1147,8 @@ module ActiveRecord
             FROM pg_type as t
             WHERE t.typname IN (%s)
           SQL
-          coders = execute_and_clear(query, "SCHEMA", [], allow_retry: true, materialize_transactions: false) do |result|
-            result.filter_map { |row| construct_coder(row, coders_by_name[row["typname"]]) }
-          end
+          result = internal_execute(query, "SCHEMA", [], allow_retry: true, materialize_transactions: false)
+          coders = result.filter_map { |row| construct_coder(row, coders_by_name[row["typname"]]) }
 
           map = YSQL::TypeMapByOid.new
           coders.each { |coder| map.add_coder(coder) }
@@ -1225,6 +1198,6 @@ module ActiveRecord
         ActiveRecord::Type.register(:vector, OID::Vector, adapter: :yugabytedb)
         ActiveRecord::Type.register(:xml, OID::Xml, adapter: :yugabytedb)
     end
-    ActiveSupport.run_load_hooks(:active_record_yugabytedbadapter, YugabyteDBAdapter)
+    ActiveSupport.run_load_hooks(:active_record_yugabytedb_adapter, YugabyteDBAdapter)
   end
 end
